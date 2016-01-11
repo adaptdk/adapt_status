@@ -1,0 +1,282 @@
+<?php
+
+/**
+ * Implements hook_ctools_plugin_api().
+ */
+function adapt_status_ctools_plugin_api($module = NULL, $api = NULL) {
+  if ($module == "strongarm" && $api == "strongarm") {
+    return array("version" => "1");
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function adapt_status_menu() {
+  $items = array();
+
+  $items['admin/config/system/adapt-status'] = array(
+    'title' => 'Adapt status',
+    'description' => 'Configuration page for Adapt Status',
+    'access arguments' => array('administrate adapt status'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('adapt_status_settings'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+function adapt_status_permission() {
+  return array(
+    'administer adapt status' => array(
+      'title' => t('Administer adapt status'),
+      'description' => t('Allow role to configure adapt status settings.'),
+    ),
+  );
+}
+
+/**
+ * Form callback for the module settings form.
+ */
+function adapt_status_settings($form, $form_state) {
+  $build_info = _adapt_status_load_build_info();
+
+  $form['adapt_status_last_build_numner'] = array(
+    '#title' => t('Latest build number'),
+    '#type' => 'textfield',
+    '#default_value' => $build_info['Build']['buildNumber'],
+    '#disabled' => TRUE,
+  );
+
+  $form['adapt_status_remote_endpoint'] = array(
+    '#title' => t('Remote endpoint'),
+    '#type' => 'textfield',
+    '#default_value' => variable_get('adapt_status_remote_endpoint', ''),
+    '#required' => TRUE,
+  );
+  $form['adapt_status_site_id'] = array(
+    '#title' => t('Site identifier'),
+    '#type' => 'textfield',
+    '#default_value' => variable_get('adapt_status_site_key', 'dev'),
+    '#required' => TRUE,
+  );
+
+  $form['adapt_status_shared_secret'] = array(
+    '#title' => t('Shared secret'),
+    '#type' => 'textfield',
+    '#default_value' => variable_get('adapt_status_shared_secret', ''),
+    '#required' => TRUE,
+  );
+
+  $form['adapt_status_enabled'] = array(
+    '#title' => t('Push enabled'),
+    '#type' => 'checkbox',
+    '#default_value' => variable_get('adapt_status_enabled', 0),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Validate callback for the adapt status settings form.
+ *
+ * @see adapt_status_settings
+ */
+function adapt_status_settings_validate($form, &$form_state) {
+  if (!valid_url($form_state['values']['adapt_status_remote_endpoint'])) {
+    form_set_error('adapt_status_remote_endpoint', t('Remote endpoint must be a valid url.'));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function adapt_status_cron() {
+
+  $remote_site = variable_get('adapt_status_remote_endpoint', '');
+  $enabled = variable_get('adapt_status_enabled', 0);
+
+  if (!empty($remote_site) && $enabled == 1) {
+    $build_info = _adapt_status_load_build_info();
+    $data = array();
+    // If the build number has changed update the build information and send it to the recipient.
+    if($build_info && $build_info['Build']['buildNumber'] != variable_get('adapt_status_last_build_numner', 0)) {
+      $data = _adapt_status_status_data($build_info);
+      // Alter hook to make the dataset alterable just in case.
+      drupal_alter('adapt_status_data', $data);
+    } else {
+      $data = array(
+        "core" => array(),
+        "contrib" => array(),
+        "custom" => "disabled",
+      );
+      $data += $build_info;
+    }
+    $data['site_id'] = variable_get('adapt_status_site_key', 'dev');
+    $sharedSecret = drupal_hmac_base64(serialize($data), variable_get('adapt_status_shared_secret', ''));
+    $options = array();
+    $options['method'] = 'POST';
+    $options['data'] = drupal_json_encode($data);
+    $options['headers'] = array(
+      'Content-Type' => 'application/json; charset=UTF-8',
+      'Accept' => 'application/json',
+      'Shared-Secret' => $sharedSecret,
+    );
+
+    $res = drupal_http_request($remote_site, $options);
+
+    if ($res->code != 200) {
+      watchdog('adapt_status', 'Cron failed. HTTP request status code %code with message: %message', array('%code' => $res->code, '%message' => $res->status_message), WATCHDOG_ERROR);
+    }
+  }
+}
+
+/**
+ * Fetch build information.
+ *
+ * @return mixed|null
+ */
+function _adapt_status_load_build_info() {
+  if(file_exists(DRUPAL_ROOT . '/build-info.json')) {
+    $info = file_get_contents(DRUPAL_ROOT . '/build-info.json');
+    return drupal_json_decode($info);
+  }
+  return NULL;
+}
+
+/**
+ * Return JSON formatted module information.
+ */
+function _adapt_status_status_data($build_info) {
+  $system_modules = system_list('module_enabled');
+  $system_themes = list_themes(TRUE);
+
+  // Needless initialisation, but hey.
+  $res = array(
+    "core" => array(),
+    "contrib" => array(),
+    "custom" => "disabled",
+  );
+  $res += $build_info;
+  // Go over Themes
+  foreach($system_themes as $theme) {
+    if(isset($theme->info['package']) && $theme->info['package'] == 'Core')
+      continue;
+
+    if(isset($theme->info['version'])) {
+      $res['contrib'][$theme->name] = array("version" => $theme->info['version']);
+    }
+  }
+
+  // Go over Modules
+  foreach ($system_modules as $module => $module_info) {
+    $filename = $module_info->filename;
+    $module_path = dirname($filename);
+    // Match for contrib modules.
+    $regex = '{^sites\/([A-z,\.,\-]+)\/modules\/*}';
+    $module_type = 'custom';
+    if(strtolower($module_info->info['package']) == "core") {
+      $module_type = 'core';
+    } elseif(strpos($module_info->filename, '/contrib/') !== FALSE) {
+      $module_type = 'contrib';
+    }
+    if (preg_match($regex, $filename)) {
+      // if this is part of a project, only set the project.
+      if(isset($module_info->info['project'])) {
+        $res['contrib'][$module_info->info['project']] = array(
+          'version' => $module_info->info['version'],
+        );
+        if (isset($module_info->info['datetime'])) {
+          $res['contrib'][$module_info->info['project']]['datetime'] = $module_info->info['datetime'];
+        }
+      }
+      else {
+        $res['contrib'][$module] = array(
+          'version' => $module_info->info['version'],
+          'datetime' => $module_info->info['datetime'],
+        );
+        if (isset($module_info->info['datetime'])) {
+          $res['contrib'][$module]['datetime'] = $module_info->info['datetime'];
+        }
+      }
+    }
+
+    // Match for core modules.
+    if ($module_type == "core") {
+      // if this is part of a project, only set the project.
+      if(isset($module_info->info['project'])) {
+        $res['core'][$module_info->info['project']] = array(
+          'version' => $module_info->info['version']
+        );
+      }
+      else {
+        $res['core'][$module] = array(
+          'version' => $module_info->info['version']
+        );
+      }
+    }
+    elseif($module_type == "contrib") {
+      $res['contrib'][$module] = array(
+        'version' => $module_info->info['version']
+      );
+    }
+
+    // Check for patches.
+    $patches = adapt_status_check_for_patches($module_path);
+    if(!empty($patches)) {
+      $res[$module_type][$module]['patches'] = $patches;
+    }
+  }
+  // doublecheck if drupal version is reported, if not add bootstrap define
+  if(!isset($res['core']['drupal'])) {
+    $res['core']['drupal'] = array(
+      'version' => VERSION
+    );
+  }
+  $patches = adapt_status_check_for_patches(DRUPAL_ROOT);
+  $res['core']['drupal']['patches'] = $patches;
+
+  // Check libraries
+  if (module_exists('libraries')) {
+    $res['libraries'] = array();
+    foreach (libraries_get_libraries() AS $name => $path) {
+      $res['libraries'][] = $name;
+    }
+  }
+
+  // Check jQuery version
+  if (module_exists('jquery_update')) {
+    $res['jquery_version'] = variable_get('jquery_update_jquery_version', '1.5');
+  }
+  else {
+    $res['jquery_version'] = '1.4';
+  }
+  variable_set('adapt_status_last_build_numner', $build_info['Build']['buildNumber']);
+  return $res;
+}
+
+/**
+ * Check for patches.
+ * Check the provided path for the PATCHES.txt file.
+ * If it exists build an array of the applied patches.
+ *
+ * @param string $path
+ * @return array
+ */
+function adapt_status_check_for_patches($path) {
+  $patches = array();
+  // Check for patches.
+  $patches_path = $path . '/PATCHES.txt';
+  if(file_exists($patches_path)) {
+    $file = fopen($patches_path, "r");
+    while(!feof($file)){
+      $line = fgets($file);
+      if(strpos($line, '- http') === 0) {
+        $patches[] = str_replace('- ', '', $line);
+      }
+    }
+    fclose($file);
+  }
+  return $patches;
+}
