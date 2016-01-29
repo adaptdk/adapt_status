@@ -93,7 +93,9 @@ function adapt_status_settings_validate($form, &$form_state) {
  * Implements hook_cron().
  */
 function adapt_status_cron() {
-
+  if (drupal_installation_attempted()) {
+    return;
+  }
   $remote_site = variable_get('adapt_status_remote_endpoint', '');
   $enabled = variable_get('adapt_status_enabled', 0);
 
