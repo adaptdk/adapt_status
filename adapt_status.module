@@ -93,19 +93,21 @@ function adapt_status_settings_validate($form, &$form_state) {
  * Implements hook_cron().
  */
 function adapt_status_cron() {
-
+  if (drupal_installation_attempted()) {
+    return;
+  }
   $remote_site = variable_get('adapt_status_remote_endpoint', '');
   $enabled = variable_get('adapt_status_enabled', 0);
 
   if (!empty($remote_site) && $enabled == 1) {
     $build_info = _adapt_status_load_build_info();
-    $data = array();
     // If the build number has changed update the build information and send it to the recipient.
     if($build_info && $build_info['Build']['buildNumber'] != variable_get('adapt_status_last_build_numner', 0)) {
       $data = _adapt_status_status_data($build_info);
       // Alter hook to make the dataset alterable just in case.
       drupal_alter('adapt_status_data', $data);
-    } else {
+    }
+    else {
       $data = array(
         "core" => array(),
         "contrib" => array(),
@@ -142,7 +144,7 @@ function _adapt_status_load_build_info() {
     $info = file_get_contents(DRUPAL_ROOT . '/build-info.json');
     return drupal_json_decode($info);
   }
-  return NULL;
+  return array();
 }
 
 /**
